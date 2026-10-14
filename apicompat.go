@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -34,9 +35,25 @@ func main() {
 	}
 }
 
+// it writes to w instead of os.Stdout and returns an error instead of
+// exiting (for testing purposes)
 func runCheck(ctx context.Context, w io.Writer, dir string, args []string) (success bool, err error) {
 
-	fmt.Println(ctx, dir, args)
-	return true, nil
+	// Validate arguments and flags.
+	// suppress errors so we can handle it ourselves in testing instead of
+	// printing to stderr
+	fs := flag.NewFlagSet("apicompat", flag.ContinueOnError)
+	fs.Usage = func() {}
+	fs.SetOutput(io.Discard)
+	var baseOpt string
+	fs.StringVar(&baseOpt, "base", "", "previous version to compare against")
+	if err := fs.Parse(args); err != nil {
+		return false, &usageError{err: err}
+	}
 
+	if len(fs.Args()) > 0 {
+		return false, usageErrorf("no arguments allowed")
+	}
+	fmt.Println(baseOpt)
+	return true, nil
 }
