@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 )
 
 func main() {
@@ -45,8 +46,8 @@ func runCheck(ctx context.Context, w io.Writer, dir string, args []string) (succ
 	fs := flag.NewFlagSet("apicompat", flag.ContinueOnError)
 	fs.Usage = func() {}
 	fs.SetOutput(io.Discard)
-	var baseOpt string
-	fs.StringVar(&baseOpt, "base", "", "previous version to compare against")
+	var baseVersion string //not checking for module path, assuming only version passed in
+	fs.StringVar(&baseVersion, "base", "", "previous version to compare against")
 	if err := fs.Parse(args); err != nil {
 		return false, &usageError{err: err}
 	}
@@ -54,6 +55,27 @@ func runCheck(ctx context.Context, w io.Writer, dir string, args []string) (succ
 	if len(fs.Args()) > 0 {
 		return false, usageErrorf("no arguments allowed")
 	}
-	fmt.Println(baseOpt)
+
+	modRoot, err := findModuleRoot(dir)
+	if err != nil {
+		return false, err
+	}
+
 	return true, nil
+}
+
+// findModuleRoot finds the root directory of the module that contains dir.
+func findModuleRoot(dir string) (string, error) {
+	d := filepath.Clean(dir)
+	for {
+		if fi, err := os.Stat(filepath.Join(d, "go.mod")); err == nil && !fi.IsDir() {
+			return dir, nil
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+	}
+	return "", fmt.Errorf("%s: cannot find go.mod file", dir)
 }
