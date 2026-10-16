@@ -10,6 +10,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/mod/modfile"
+	// "golang.org/x/tools/go/packages"
 )
 
 func main() {
@@ -61,6 +64,14 @@ func runCheck(ctx context.Context, w io.Writer, dir string, args []string) (succ
 		return false, err
 	}
 
+	// Load packages for the version to be released from the local directory.
+	release, err := loadLocalModule(ctx, modRoot)
+	if err != nil {
+		return false, err
+	}
+
+	fmt.Println(release)
+
 	return true, nil
 }
 
@@ -78,4 +89,47 @@ func findModuleRoot(dir string) (string, error) {
 		d = parent
 	}
 	return "", fmt.Errorf("%s: cannot find go.mod file", dir)
+}
+
+type moduleInfo struct {
+	modRoot                  string // module root directory
+	repoRoot                 string // repository root directory (may be "")
+	modPath                  string // module path in go.mod
+	version                  string // resolved version or "none"
+	versionQuery             string // a query like "latest" or "dev-branch", if specified
+	versionInferred          bool   // true if the version was unspecified and inferred
+	highestTransitiveVersion string // version of the highest transitive self-dependency (cycle)
+	modPathMajor             string // major version suffix like "/v3" or ".v2"
+	tagPrefix                string // prefix for version tags if module not in repo root
+
+	goModPath string        // file path to go.mod
+	goModData []byte        // content of go.mod
+	goSumData []byte        // content of go.sum
+	goModFile *modfile.File // parsed go.mod file
+
+	diagnostics []string // problems not related to loading specific packages
+	// pkgs        []*packages.Package // loaded packages with type information
+
+}
+
+func loadLocalModule(ctx context.Context, modRoot string) (m moduleInfo, err error) {
+
+	m = moduleInfo{
+		modRoot:   modRoot,
+		goModPath: filepath.Join(modRoot, "go.mod"),
+	}
+
+	m.goModData, err = os.ReadFile(m.goModPath)
+	if err != nil {
+		return moduleInfo{}, err
+	}
+	m.goModFile, err = modfile.ParseLax(m.goModPath, m.goModData, nil)
+	if err != nil {
+		return moduleInfo{}, err
+	}
+	if m.goModFile.Module == nil {
+		return moduleInfo{}, fmt.Errorf("%s: module directive is missing", m.goModPath)
+	}
+
+	return m, nil
 }
