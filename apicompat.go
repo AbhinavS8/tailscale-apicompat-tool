@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 	// "golang.org/x/tools/go/packages"
 )
 
@@ -131,5 +132,74 @@ func loadLocalModule(ctx context.Context, modRoot string) (m moduleInfo, err err
 		return moduleInfo{}, fmt.Errorf("%s: module directive is missing", m.goModPath)
 	}
 
+	m.modPath = m.goModFile.Module.Mod.Path
+	if err := module.CheckPath(m.modPath); err != nil {
+		return moduleInfo{}, err
+	}
+
+
+	// Load the module's packages.
+	// We pack the module into a zip file and extract it to a temporary directory
+	// as if it were published and downloaded. We'll detect any errors that would
+	// occur (for example, invalid file names). We avoid loading it as the
+	// main module.
+	tmpModRoot, err := copyModuleToTempDir(repoRoot, m.modPath, m.modRoot)
+	if err != nil {
+		return moduleInfo{}, err
+	}
+	defer func() {
+		if rerr := os.RemoveAll(tmpModRoot); err == nil && rerr != nil {
+			err = fmt.Errorf("removing temporary module directory: %v", rerr)
+		}
+	}()
+	tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, prepareDiagnostics, err := prepareLoadDir(ctx, m.goModFile, m.modPath, tmpModRoot, version, false)
+	if err != nil {
+		return moduleInfo{}, err
+	}
+	defer func() {
+		if rerr := os.RemoveAll(tmpLoadDir); err == nil && rerr != nil {
+			err = fmt.Errorf("removing temporary load directory: %v", rerr)
+		}
+	}()
+
+	var loadDiagnostics []string
+	m.pkgs, loadDiagnostics, err = loadPackages(ctx, m.modPath, tmpModRoot, tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths)
+	if err != nil {
+		return moduleInfo{}, err
+	}
+
+	m.diagnostics = append(m.diagnostics, prepareDiagnostics...)
+	m.diagnostics = append(m.diagnostics, loadDiagnostics...)
+	if packagesHaveErrors(m.pkgs) {
+		// m.goModFile was parsed with ParseLax, which ignores replace and
+		// exclude directives.
+		modFile, err := modfile.Parse(m.goModPath, m.goModData, nil)
+		if err == nil {
+			if d := constructReplaceExcludeDiagnostic(modFile); d != "" {
+				m.diagnostics = append(m.diagnostics, d)
+			}
+		}
+	}
+
+	highestVersion, err := findSelectedVersion(ctx, tmpLoadDir, m.modPath)
+	if err != nil {
+		return moduleInfo{}, err
+	}
+
+	if highestVersion != "" {
+		// A version of the module is included in the transitive dependencies.
+		// Add it to the moduleInfo so that the release report stage can use it
+		// in verifying the version or suggestion a new version, depending on
+		// whether the user provided a version already.
+		m.highestTransitiveVersion = highestVersion
+	}
+
+	retracted, err := loadRetractions(ctx, tmpLoadDir)
+	if err != nil {
+		return moduleInfo{}, err
+	}
+	m.diagnostics = append(m.diagnostics, retracted...)
+
 	return m, nil
 }
+
