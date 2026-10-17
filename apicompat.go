@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -137,13 +138,12 @@ func loadLocalModule(ctx context.Context, modRoot string) (m moduleInfo, err err
 		return moduleInfo{}, err
 	}
 
-
 	// Load the module's packages.
 	// We pack the module into a zip file and extract it to a temporary directory
 	// as if it were published and downloaded. We'll detect any errors that would
 	// occur (for example, invalid file names). We avoid loading it as the
 	// main module.
-	tmpModRoot, err := copyModuleToTempDir(repoRoot, m.modPath, m.modRoot)
+	tmpModRoot, err := copyModuleToTempDir(m.modRoot)
 	if err != nil {
 		return moduleInfo{}, err
 	}
@@ -152,54 +152,61 @@ func loadLocalModule(ctx context.Context, modRoot string) (m moduleInfo, err err
 			err = fmt.Errorf("removing temporary module directory: %v", rerr)
 		}
 	}()
-	tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, prepareDiagnostics, err := prepareLoadDir(ctx, m.goModFile, m.modPath, tmpModRoot, version, false)
-	if err != nil {
-		return moduleInfo{}, err
-	}
-	defer func() {
-		if rerr := os.RemoveAll(tmpLoadDir); err == nil && rerr != nil {
-			err = fmt.Errorf("removing temporary load directory: %v", rerr)
-		}
-	}()
-
-	var loadDiagnostics []string
-	m.pkgs, loadDiagnostics, err = loadPackages(ctx, m.modPath, tmpModRoot, tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths)
-	if err != nil {
-		return moduleInfo{}, err
-	}
-
-	m.diagnostics = append(m.diagnostics, prepareDiagnostics...)
-	m.diagnostics = append(m.diagnostics, loadDiagnostics...)
-	if packagesHaveErrors(m.pkgs) {
-		// m.goModFile was parsed with ParseLax, which ignores replace and
-		// exclude directives.
-		modFile, err := modfile.Parse(m.goModPath, m.goModData, nil)
-		if err == nil {
-			if d := constructReplaceExcludeDiagnostic(modFile); d != "" {
-				m.diagnostics = append(m.diagnostics, d)
-			}
-		}
-	}
-
-	highestVersion, err := findSelectedVersion(ctx, tmpLoadDir, m.modPath)
-	if err != nil {
-		return moduleInfo{}, err
-	}
-
-	if highestVersion != "" {
-		// A version of the module is included in the transitive dependencies.
-		// Add it to the moduleInfo so that the release report stage can use it
-		// in verifying the version or suggestion a new version, depending on
-		// whether the user provided a version already.
-		m.highestTransitiveVersion = highestVersion
-	}
-
-	retracted, err := loadRetractions(ctx, tmpLoadDir)
-	if err != nil {
-		return moduleInfo{}, err
-	}
-	m.diagnostics = append(m.diagnostics, retracted...)
+	// tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, prepareDiagnostics, err := prepareLoadDir(ctx, m.goModFile, m.modPath, tmpModRoot, version, false)
+	// if err != nil {
+	// 	return moduleInfo{}, err
+	// }
+	// defer func() {
+	// 	if rerr := os.RemoveAll(tmpLoadDir); err == nil && rerr != nil {
+	// 		err = fmt.Errorf("removing temporary load directory: %v", rerr)
+	// 	}
+	// }()
 
 	return m, nil
 }
 
+func copyModuleToTempDir(modRoot string) (string, error) {
+	dir, err := os.MkdirTemp("", "apicompat")
+	if err != nil {
+		return "", err
+	}
+
+	err = filepath.WalkDir(modRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(modRoot, path)
+
+		if d.IsDir() {
+			// Skip vendor, VCS dirs, and submodules
+			name := d.Name()
+			if name == "vendor" || name == ".git" || name == ".hg" {
+				return filepath.SkipDir
+			}
+			// Skip submodules (has its own go.mod)
+			if rel != "." {
+				if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+					return filepath.SkipDir
+				}
+			}
+			return os.MkdirAll(filepath.Join(dir, rel), 0777)
+		}
+
+		// Only copy regular files (no symlinks)
+		if !d.Type().IsRegular() {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dir, rel), data, 0666)
+	})
+
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	return dir, nil
+}
