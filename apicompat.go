@@ -152,15 +152,16 @@ func loadLocalModule(ctx context.Context, modRoot string) (m moduleInfo, err err
 			err = fmt.Errorf("removing temporary module directory: %v", rerr)
 		}
 	}()
-	// tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, prepareDiagnostics, err := prepareLoadDir(ctx, m.goModFile, m.modPath, tmpModRoot, version, false)
-	// if err != nil {
-	// 	return moduleInfo{}, err
-	// }
-	// defer func() {
-	// 	if rerr := os.RemoveAll(tmpLoadDir); err == nil && rerr != nil {
-	// 		err = fmt.Errorf("removing temporary load directory: %v", rerr)
-	// 	}
-	// }()
+
+	tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, prepareDiagnostics, err := prepareLoadDir(ctx, m.goModFile, m.modPath, tmpModRoot, false)
+	if err != nil {
+		return moduleInfo{}, err
+	}
+	defer func() {
+		if rerr := os.RemoveAll(tmpLoadDir); err == nil && rerr != nil {
+			err = fmt.Errorf("removing temporary load directory: %v", rerr)
+		}
+	}()
 
 	return m, nil
 }
@@ -209,4 +210,100 @@ func copyModuleToTempDir(modRoot string) (string, error) {
 		return "", err
 	}
 	return dir, nil
+}
+
+// prepareLoadDir creates a temporary directory and a go.mod file that requires
+// the module being loaded. go.sum is copied if present. It also creates a .go
+// file that imports every package in the given modPath. This temporary module
+// is useful for two reasons. First, replace and exclude directives from the
+// target module aren't applied, so we have the same view as a dependent module.
+// Second, we can run commands like 'go get' without modifying the original
+// go.mod and go.sum files.
+//
+// modFile is the pre-parsed go.mod file. If non-nil, its requirements and
+// go version will be copied so that incomplete and out-of-date requirements
+// may be reported later.
+//
+// modPath is the module's path.
+//
+// modRoot is the module's root directory.
+//
+// version is the version of the module being loaded. If must be canonical
+// for modules loaded from the cache. Otherwise, it may be empty (for example,
+// when no release version is proposed).
+//
+// cached indicates whether the module is being loaded from the module cache.
+// If cached is true, then the module lives in the cache at
+// $GOMODCACHE/$modPath@$version/. Its go.mod file is at
+// $GOMODCACHE/cache/download/$modPath/@v/$version.mod. It must be referenced
+// with a simple require. A replace directive won't work because it may not have
+// a go.mod file in modRoot.
+// If cached is false, then modRoot is somewhere outside the module cache
+// (ex /tmp). We'll reference it with a local replace directive. It must have a
+// go.mod file in modRoot.
+//
+// dir is the location of the temporary directory.
+//
+// goModData and goSumData are the contents of the go.mod and go.sum files,
+// respectively.
+//
+// pkgPaths are the import paths of the module being loaded, including the path
+// to any main packages (as if they were importable).
+func prepareLoadDir(ctx context.Context, modFile *modfile.File, modPath, modRoot, version string, cached bool) (dir string, goModData, goSumData []byte, pkgPaths []string, diagnostics []string, err error) {
+	defer func() {
+		if err != nil {
+			if cached {
+				err = fmt.Errorf("preparing to load packages for %s@%s: %w", modPath, version, err)
+			} else {
+				err = fmt.Errorf("preparing to load packages for %s: %w", modPath, err)
+			}
+		}
+	}()
+
+	dir, err = os.MkdirTemp("", "apicompat-load")
+	if err != nil {
+		return "", nil, nil, nil, nil, err
+	}
+
+	f := &modfile.File{}
+	f.AddModuleStmt("apicompat-load-module")
+	f.AddRequire(modPath, version)
+	if !cached {
+		// Replace all versions of modPath (not just the specific version
+		// required above) with the local module directory. A version-scoped
+		// replace only takes effect when minimal version selection picks that
+		// exact version. If the module appears in its own build graph as a
+		// transitive dependency at a higher version (an import cycle across
+		// modules, e.g. a -> b -> a), MVS selects that higher version, the
+		// version-scoped replace is silently ignored, and the published
+		// module is loaded from the cache instead of the local directory.
+		// That makes the local module's API look like the older published
+		// version and reports spurious changes. A wildcard replace pins the
+		// local directory regardless of the selected version.
+		f.AddReplace(modPath, "", modRoot, "")
+	}
+	if modFile != nil {
+		if modFile.Go != nil {
+			f.AddGoStmt(modFile.Go.Version)
+		}
+		for _, r := range modFile.Require {
+			f.AddRequire(r.Mod.Path, r.Mod.Version)
+		}
+	}
+	goModData, err = f.Format()
+	if err != nil {
+		return "", nil, nil, nil, nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), goModData, 0666); err != nil {
+		return "", nil, nil, nil, nil, err
+	}
+
+	goSumData, err = os.ReadFile(filepath.Join(modRoot, "go.sum"))
+	if err != nil && !os.IsNotExist(err) {
+		return "", nil, nil, nil, nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.sum"), goSumData, 0666); err != nil {
+		return "", nil, nil, nil, nil, err
+	}
+
 }
