@@ -10,6 +10,10 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"path"
+	"go/build"
+	"errors"
+	"os/exec"
 	"strings"
 	"path/filepath"
 
@@ -402,4 +406,124 @@ func prepareLoadDir(ctx context.Context, modFile *modfile.File, modPath, modRoot
 	}
 
 	return dir, goModData, goSumData, imps, diagnostics, nil
+}
+
+func cleanCmdError(err error) error {
+	if xerr, ok := err.(*exec.ExitError); ok {
+		if stderr := strings.TrimSpace(string(xerr.Stderr)); stderr != "" {
+			return errors.New(stderr)
+		}
+	}
+	return err
+}
+
+func copyEnv(ctx context.Context, current []string) []string {
+	env, ok := ctx.Value("env").([]string)
+	if !ok {
+		return current
+	}
+	clone := make([]string, len(env))
+	copy(clone, env)
+	return clone
+}
+
+// sumsMatchIgnoringPath checks whether the two sums match. It ignores any lines
+// which contains the given modPath.
+func sumsMatchIgnoringPath(sum1, sum2, modPathToIgnore string) bool {
+	lines1 := make(map[string]bool)
+	for _, line := range strings.Split(string(sum1), "\n") {
+		if line == "" {
+			continue
+		}
+		lines1[line] = true
+	}
+	for _, line := range strings.Split(string(sum2), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 1 {
+			panic(fmt.Sprintf("go.sum malformed: unexpected line %s", line))
+		}
+		if parts[0] == modPathToIgnore {
+			continue
+		}
+
+		if !lines1[line] {
+			return false
+		}
+	}
+
+	lines2 := make(map[string]bool)
+	for _, line := range strings.Split(string(sum2), "\n") {
+		if line == "" {
+			continue
+		}
+		lines2[line] = true
+	}
+	for _, line := range strings.Split(string(sum1), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 1 {
+			panic(fmt.Sprintf("go.sum malformed: unexpected line %s", line))
+		}
+		if parts[0] == modPathToIgnore {
+			continue
+		}
+
+		if !lines2[line] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// collectImportPaths visits the given root and traverses its directories
+// recursively, collecting the import paths of all importable packages in each
+// directory along the way.
+//
+// modPath is the module path.
+// root is the root directory of the module to collect imports for (the root
+// of the modPath module).
+//
+// Note: the returned importPaths will include main if it exists in root.
+func collectImportPaths(modPath, root string) (importPaths []string, _ error) {
+	err := filepath.Walk(root, func(walkPath string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Avoid .foo, _foo, and testdata subdirectory trees.
+		if !fi.IsDir() {
+			return nil
+		}
+		base := filepath.Base(walkPath)
+		if strings.HasPrefix(base, ".") || strings.HasPrefix(base, "_") || base == "testdata" || base == "internal" {
+			return filepath.SkipDir
+		}
+
+		p, err := build.Default.ImportDir(walkPath, 0)
+		if err != nil {
+			if nogoErr := (*build.NoGoError)(nil); errors.As(err, &nogoErr) {
+				// No .go files found in directory. That's ok, we'll keep
+				// searching.
+				return nil
+			}
+			return err
+		}
+
+		// Construct the import path.
+		importPath := path.Join(modPath, filepath.ToSlash(trimFilePathPrefix(p.Dir, root)))
+		importPaths = append(importPaths, importPath)
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing packages in %s: %v", root, err)
+	}
+
+	return importPaths, nil
 }
