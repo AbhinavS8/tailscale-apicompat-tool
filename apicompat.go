@@ -4,18 +4,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"go/build"
 	"io"
 	"io/fs"
 	"log"
 	"os"
-	"path"
-	"go/build"
-	"errors"
 	"os/exec"
-	"strings"
+	"path"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
@@ -24,7 +24,7 @@ import (
 
 func main() {
 	log.SetFlags(0)
-	log.SetPrefix("gorelease: ")
+	log.SetPrefix("apicompat: ")
 
 	wd, err := os.Getwd()
 	if err != nil {
@@ -273,7 +273,7 @@ func prepareLoadDir(ctx context.Context, modFile *modfile.File, modPath, modRoot
 
 	f := &modfile.File{}
 	f.AddModuleStmt("apicompat-load-module")
-	f.AddRequire(modPath, "")
+	f.AddRequire(modPath, "v0.0.0")
 	if !cached {
 		// Replace all versions of modPath (not just the specific version
 		// required above) with the local module directory. A version-scoped
@@ -328,7 +328,7 @@ func prepareLoadDir(ctx context.Context, modFile *modfile.File, modPath, modRoot
 	}
 
 	// Add missing requirements.
-	cmd := exec.CommandContext(ctx, "go", "get", "-d", ".")
+	cmd := exec.CommandContext(ctx, "go", "get", ".")
 	cmd.Env = copyEnv(ctx, cmd.Env)
 	cmd.Dir = dir
 	if _, err := cmd.Output(); err != nil {
