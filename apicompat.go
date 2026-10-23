@@ -153,7 +153,7 @@ func loadLocalModule(ctx context.Context, modRoot string) (m moduleInfo, err err
 		}
 	}()
 
-	tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, prepareDiagnostics, err := prepareLoadDir(ctx, m.goModFile, m.modPath, tmpModRoot, false)
+	tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, prepareDiagnostics, err := prepareLoadDir(ctx, m.goModFile, m.modPath, tmpModRoot, "", false)
 	if err != nil {
 		return moduleInfo{}, err
 	}
@@ -163,6 +163,7 @@ func loadLocalModule(ctx context.Context, modRoot string) (m moduleInfo, err err
 		}
 	}()
 
+	fmt.Println(tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, prepareDiagnostics)
 	return m, nil
 }
 
@@ -249,11 +250,11 @@ func copyModuleToTempDir(modRoot string) (string, error) {
 //
 // pkgPaths are the import paths of the module being loaded, including the path
 // to any main packages (as if they were importable).
-func prepareLoadDir(ctx context.Context, modFile *modfile.File, modPath, modRoot, version string, cached bool) (dir string, goModData, goSumData []byte, pkgPaths []string, diagnostics []string, err error) {
+func prepareLoadDir(ctx context.Context, modFile *modfile.File, modPath, modRoot string, cached bool) (dir string, goModData, goSumData []byte, pkgPaths []string, diagnostics []string, err error) {
 	defer func() {
 		if err != nil {
 			if cached {
-				err = fmt.Errorf("preparing to load packages for %s@%s: %w", modPath, version, err)
+				err = fmt.Errorf("preparing to load packages for %s@%s: %w", modPath, err)
 			} else {
 				err = fmt.Errorf("preparing to load packages for %s: %w", modPath, err)
 			}
@@ -267,7 +268,7 @@ func prepareLoadDir(ctx context.Context, modFile *modfile.File, modPath, modRoot
 
 	f := &modfile.File{}
 	f.AddModuleStmt("apicompat-load-module")
-	f.AddRequire(modPath, version)
+	f.AddRequire(modPath, "")
 	if !cached {
 		// Replace all versions of modPath (not just the specific version
 		// required above) with the local module directory. A version-scoped
@@ -305,5 +306,6 @@ func prepareLoadDir(ctx context.Context, modFile *modfile.File, modPath, modRoot
 	if err := os.WriteFile(filepath.Join(dir, "go.sum"), goSumData, 0666); err != nil {
 		return "", nil, nil, nil, nil, err
 	}
+
 
 }
