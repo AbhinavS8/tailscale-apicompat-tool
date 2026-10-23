@@ -527,3 +527,44 @@ func collectImportPaths(modPath, root string) (importPaths []string, _ error) {
 
 	return importPaths, nil
 }
+
+// trimFilePathPrefix returns the given filesystem path s without the leading
+// prefix.
+func trimFilePathPrefix(s, prefix string) string {
+	sv := strings.ToUpper(filepath.VolumeName(s))
+	pv := strings.ToUpper(filepath.VolumeName(prefix))
+	s = s[len(sv):]
+	prefix = prefix[len(pv):]
+
+	if !hasFilePathPrefix(s, prefix) || len(prefix) == 0 {
+		return s
+	}
+	if len(s) == len(prefix) {
+		return ""
+	}
+	if prefix[len(prefix)-1] == filepath.Separator {
+		return strings.TrimPrefix(s, prefix)
+	}
+	return s[len(prefix)+1:]
+}
+func hasFilePathPrefix(s, prefix string) bool {
+	sv := strings.ToUpper(filepath.VolumeName(s))
+	pv := strings.ToUpper(filepath.VolumeName(prefix))
+	s = s[len(sv):]
+	prefix = prefix[len(pv):]
+	switch {
+	default:
+		return false
+	case pv != "" && sv != pv:
+		return false
+	case len(s) == len(prefix):
+		return s == prefix
+	case prefix == "":
+		return true
+	case len(s) > len(prefix):
+		if prefix[len(prefix)-1] == filepath.Separator {
+			return strings.HasPrefix(s, prefix)
+		}
+		return s[len(prefix)] == filepath.Separator && s[:len(prefix)] == prefix
+	}
+}
