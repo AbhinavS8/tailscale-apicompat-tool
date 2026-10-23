@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"strings"
 	"path/filepath"
 
 	"golang.org/x/mod/modfile"
@@ -153,7 +154,7 @@ func loadLocalModule(ctx context.Context, modRoot string) (m moduleInfo, err err
 		}
 	}()
 
-	tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, prepareDiagnostics, err := prepareLoadDir(ctx, m.goModFile, m.modPath, tmpModRoot, "", false)
+	tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, prepareDiagnostics, err := prepareLoadDir(ctx, m.goModFile, m.modPath, tmpModRoot, false)
 	if err != nil {
 		return moduleInfo{}, err
 	}
@@ -307,5 +308,98 @@ func prepareLoadDir(ctx context.Context, modFile *modfile.File, modPath, modRoot
 		return "", nil, nil, nil, nil, err
 	}
 
+	// Add a .go file with requirements, so that `go get` won't blat
+	// requirements.
+	fakeImports := &strings.Builder{}
+	fmt.Fprint(fakeImports, "package tmp\n")
+	imps, err := collectImportPaths(modPath, modRoot)
+	if err != nil {
+		return "", nil, nil, nil, nil, err
+	}
+	for _, imp := range imps {
+		fmt.Fprintf(fakeImports, "import _ %q\n", imp)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tmp.go"), []byte(fakeImports.String()), 0666); err != nil {
+		return "", nil, nil, nil, nil, err
+	}
 
+	// Add missing requirements.
+	cmd := exec.CommandContext(ctx, "go", "get", "-d", ".")
+	cmd.Env = copyEnv(ctx, cmd.Env)
+	cmd.Dir = dir
+	if _, err := cmd.Output(); err != nil {
+		return "", nil, nil, nil, nil, fmt.Errorf("looking for missing dependencies: %w", cleanCmdError(err))
+	}
+
+	// Report new requirements in go.mod.
+	goModPath := filepath.Join(dir, "go.mod")
+	loadReqs := func(data []byte) (reqs []module.Version, err error) {
+		modFile, err := modfile.ParseLax(goModPath, data, nil)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range modFile.Require {
+			reqs = append(reqs, r.Mod)
+		}
+		return reqs, nil
+	}
+
+	oldReqs, err := loadReqs(goModData)
+	if err != nil {
+		return "", nil, nil, nil, nil, err
+	}
+	newGoModData, err := os.ReadFile(goModPath)
+	if err != nil {
+		return "", nil, nil, nil, nil, err
+	}
+	newReqs, err := loadReqs(newGoModData)
+	if err != nil {
+		return "", nil, nil, nil, nil, err
+	}
+
+	oldMap := make(map[module.Version]bool)
+	for _, req := range oldReqs {
+		oldMap[req] = true
+	}
+	var missing []module.Version
+	for _, req := range newReqs {
+		// Ignore cyclic imports, since a module never needs to require itself.
+		if req.Path == modPath {
+			continue
+		}
+		if !oldMap[req] {
+			missing = append(missing, req)
+		}
+	}
+
+	if len(missing) > 0 {
+		var missingReqs []string
+		for _, m := range missing {
+			missingReqs = append(missingReqs, m.String())
+		}
+		diagnostics = append(diagnostics, fmt.Sprintf("go.mod: the following requirements are needed\n\t%s\nRun 'go mod tidy' to add missing requirements.", strings.Join(missingReqs, "\n\t")))
+		return dir, goModData, goSumData, imps, diagnostics, nil
+	}
+
+	// Cached modules may have no go.sum.
+	// We skip comparison because a downloaded module is outside the user's
+	// control.
+	if !cached {
+		// Check if 'go get' added new hashes to go.sum.
+		goSumPath := filepath.Join(dir, "go.sum")
+		newGoSumData, err := os.ReadFile(goSumPath)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return "", nil, nil, nil, nil, err
+			}
+			// If the sum doesn't exist, that's ok: we'll treat "no go.sum" like
+			// "empty go.sum".
+		}
+
+		if !sumsMatchIgnoringPath(string(goSumData), string(newGoSumData), modPath) {
+			diagnostics = append(diagnostics, "go.sum: one or more sums are missing. Run 'go mod tidy' to add missing sums.")
+		}
+	}
+
+	return dir, goModData, goSumData, imps, diagnostics, nil
 }
