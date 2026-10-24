@@ -56,14 +56,27 @@ func runCheck(ctx context.Context, w io.Writer, dir string, args []string) (succ
 	fs := flag.NewFlagSet("apicompat", flag.ContinueOnError)
 	fs.Usage = func() {}
 	fs.SetOutput(io.Discard)
-	var baseVersion string //not checking for module path, assuming only version passed in
-	fs.StringVar(&baseVersion, "base", "", "previous version to compare against")
+	var baseOpt string //not checking for module path, assuming only version passed in
+	fs.StringVar(&baseOpt, "base", "", "previous version to compare against")
 	if err := fs.Parse(args); err != nil {
 		return false, &usageError{err: err}
 	}
 
 	if len(fs.Args()) > 0 {
 		return false, usageErrorf("no arguments allowed")
+	}
+
+	var baseModPath, baseVersion string
+	if at := strings.Index(baseOpt, "@"); at >= 0 {
+		baseModPath = baseOpt[:at]
+		baseVersion = baseOpt[at+1:]
+	} else if dot, slash := strings.Index(baseOpt, "."), strings.Index(baseOpt, "/"); dot >= 0 && slash >= 0 && dot < slash {
+		baseModPath = baseOpt
+	} else {
+		baseVersion = baseOpt
+	}
+	if baseModPath != "" && baseVersion == "none" {
+		return false, usageErrorf(`base version (%q) cannot have version "none" with explicit module path`, baseOpt)
 	}
 
 	modRoot, err := findModuleRoot(dir)
@@ -77,7 +90,12 @@ func runCheck(ctx context.Context, w io.Writer, dir string, args []string) (succ
 		return false, err
 	}
 
-	fmt.Println(release)
+	// Find the base version if there is one, download it, and load packages from
+	// the module cache.
+	base, err := loadDownloadedModule(ctx, baseModPath, baseVersion, max)
+	if err != nil {
+		return false, err
+	}
 
 	return true, nil
 }
