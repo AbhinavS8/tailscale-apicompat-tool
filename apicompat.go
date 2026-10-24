@@ -1,5 +1,3 @@
-//core logic
-
 package main
 
 import (
@@ -89,6 +87,10 @@ func runCheck(ctx context.Context, w io.Writer, dir string, args []string) (succ
 	if err != nil {
 		return false, err
 	}
+
+	// fmt.Println("\n\n")
+	// fmt.Println(baseOpt, baseModPath, baseVersion)
+	fmt.Println(release)
 
 	// Find the base version if there is one, download it, and load packages from
 	// the module cache.
@@ -585,4 +587,114 @@ func hasFilePathPrefix(s, prefix string) bool {
 		}
 		return s[len(prefix)] == filepath.Separator && s[:len(prefix)] == prefix
 	}
+}
+
+// loadDownloadedModule downloads a module and loads information about it and
+// its packages from the module cache.
+//
+// modPath is the module path used to fetch the module. The module's path in
+// go.mod (m.modPath) may be different, for example in a soft fork intended as
+// a replacement.
+//
+// version is the version to load. It may be "none" (indicating nothing should
+// be loaded), "" (the highest available version below max should be used), a
+// version query (to be resolved with 'go list'), or a canonical version.
+//
+// If version is "" and max is not "", available versions greater than or equal
+// to max will not be considered. Typically, loadDownloadedModule is used to
+// load the base version, and max is the release version.
+func loadDownloadedModule(ctx context.Context, modPath, version, max string) (m moduleInfo, err error) {
+	// Check the module path and version.
+	// If the version is a query, resolve it to a canonical version.
+	m = moduleInfo{modPath: modPath}
+	if err := checkModPath(modPath); err != nil {
+		return moduleInfo{}, err
+	}
+
+	var ok bool
+	_, m.modPathMajor, ok = module.SplitPathVersion(modPath)
+	if !ok {
+		// we just validated the path above.
+		panic(fmt.Sprintf("could not find version suffix in module path %q", modPath))
+	}
+
+	if version == "none" {
+		// We don't have a base version to compare against.
+		m.version = "none"
+		return m, nil
+	}
+	if version == "" {
+		// Unspecified version: use the highest version below max.
+		m.versionInferred = true
+		if m.version, err = inferBaseVersion(ctx, modPath, max); err != nil {
+			return moduleInfo{}, err
+		}
+		if m.version == "none" {
+			return m, nil
+		}
+	} else if version != module.CanonicalVersion(version) {
+		// Version query: find the real version.
+		m.versionQuery = version
+		if m.version, err = queryVersion(ctx, modPath, version); err != nil {
+			return moduleInfo{}, err
+		}
+		if m.version != "none" && max != "" && semver.Compare(m.version, max) >= 0 {
+			// TODO(jayconrod): reconsider this comparison for pseudo-versions in
+			// general. A query might match different pseudo-versions over time,
+			// depending on ancestor versions, so this might start failing with
+			// no local change.
+			return moduleInfo{}, fmt.Errorf("base version %s (%s) must be lower than release version %s", m.version, m.versionQuery, max)
+		}
+	} else {
+		// Canonical version: make sure it matches the module path.
+		if err := module.CheckPathMajor(version, m.modPathMajor); err != nil {
+			// TODO(golang.org/issue/39666): don't assume this is the base version
+			// or that we're comparing across major versions.
+			return moduleInfo{}, fmt.Errorf("can't compare major versions: base version %s does not belong to module %s", version, modPath)
+		}
+		m.version = version
+	}
+
+	// Download the module into the cache and load the mod file.
+	// Note that goModPath is $GOMODCACHE/cache/download/$modPath/@v/$version.mod,
+	// which is not inside modRoot. This is what the go command uses. Even if
+	// the module didn't have a go.mod file, one will be synthesized there.
+	v := module.Version{Path: modPath, Version: m.version}
+	if m.modRoot, m.goModPath, err = downloadModule(ctx, v); err != nil {
+		return moduleInfo{}, err
+	}
+	if m.goModData, err = os.ReadFile(m.goModPath); err != nil {
+		return moduleInfo{}, err
+	}
+	if m.goModFile, err = modfile.ParseLax(m.goModPath, m.goModData, nil); err != nil {
+		return moduleInfo{}, err
+	}
+	if m.goModFile.Module == nil {
+		return moduleInfo{}, fmt.Errorf("%s: missing module directive", m.goModPath)
+	}
+	m.modPath = m.goModFile.Module.Mod.Path
+
+	// Load packages.
+	tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths, _, err := prepareLoadDir(ctx, nil, m.modPath, m.modRoot, m.version, true)
+	if err != nil {
+		return moduleInfo{}, err
+	}
+	defer func() {
+		if rerr := os.RemoveAll(tmpLoadDir); err == nil && rerr != nil {
+			err = fmt.Errorf("removing temporary load directory: %v", err)
+		}
+	}()
+
+	if m.pkgs, _, err = loadPackages(ctx, m.modPath, m.modRoot, tmpLoadDir, tmpGoModData, tmpGoSumData, pkgPaths); err != nil {
+		return moduleInfo{}, err
+	}
+
+	// Calculate the existing versions.
+	ev, err := existingVersions(ctx, m.modPath, tmpLoadDir)
+	if err != nil {
+		return moduleInfo{}, err
+	}
+	m.existingVersions = ev
+
+	return m, nil
 }
