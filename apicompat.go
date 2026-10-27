@@ -96,11 +96,12 @@ func runCheck(ctx context.Context, w io.Writer, dir string, args []string) (succ
 
 	// Find the base version if there is one, download it, and load packages from
 	// the module cache.
-	base, err := loadDownloadedModule(ctx, baseModPath, baseVersion, max)
+	base, err := loadDownloadedModule(ctx, baseModPath, baseVersion, "")
 	if err != nil {
 		return false, err
 	}
 
+	fmt.Println(base)
 	return true, nil
 }
 
