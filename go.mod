@@ -7,4 +7,7 @@ require (
 	golang.org/x/tools v0.52.0
 )
 
-require golang.org/x/sync v0.24.0 // indirect
+require (
+	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
+	golang.org/x/sync v0.24.0 // indirect
+)

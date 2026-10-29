@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 
+	"golang.org/x/exp/apidiff"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 	"golang.org/x/tools/go/packages"
@@ -101,8 +102,15 @@ func runCheck(ctx context.Context, w io.Writer, dir string, args []string) (succ
 		return false, err
 	}
 
-	fmt.Println(base)
-	return true, nil
+	// Compare packages and check for other issues.
+	report, err := makeReleaseReport(ctx, base, release)
+	if err != nil {
+		return false, err
+	}
+	if _, err := fmt.Fprint(w, report.String()); err != nil {
+		return false, err
+	}
+	return report.isSuccessful(), nil
 }
 
 // findModuleRoot finds the root directory of the module that contains dir.
@@ -140,6 +148,10 @@ type moduleInfo struct {
 	diagnostics []string            // problems not related to loading specific packages
 	pkgs        []*packages.Package // loaded packages with type information
 
+}
+
+type packagePair struct {
+	base, release *packages.Package
 }
 
 func loadLocalModule(ctx context.Context, modRoot string) (m moduleInfo, err error) {
@@ -903,4 +915,172 @@ func loadPackages(ctx context.Context, modPath, modRoot, loadDir string, goModDa
 	}
 
 	return pkgs, diagnostics, nil
+}
+
+func hasPathPrefix(s, prefix string) bool {
+	if len(s) == len(prefix) {
+		return s == prefix
+	}
+	if prefix == "" {
+		return true
+	}
+	if len(s) > len(prefix) {
+		if prefix[len(prefix)-1] == '/' || s[len(prefix)] == '/' {
+			return s[:len(prefix)] == prefix
+		}
+	}
+	return false
+}
+
+// makeReleaseReport returns a report comparing the current version of a
+// module with a previously released version. The report notes any backward
+// compatible and incompatible changes in the module's public API. It also
+// diagnoses common problems, such as go.mod or go.sum being incomplete.
+// The report recommends or validates a release version and indicates a
+// version control tag to use (with an appropriate prefix, for modules not
+// in the repository root directory).
+func makeReleaseReport(ctx context.Context, base, release moduleInfo) (report, error) {
+	// TODO: use apidiff.ModuleChanges.
+	// Compare each pair of packages.
+	// Ignore internal packages.
+	// If we don't have a base version to compare against just check the new
+	// packages for errors.
+	shouldCompare := base.version != "none"
+	isInternal := func(modPath, pkgPath string) bool {
+		if !hasPathPrefix(pkgPath, modPath) {
+			panic(fmt.Sprintf("package %s not in module %s", pkgPath, modPath))
+		}
+		for pkgPath != modPath {
+			if path.Base(pkgPath) == "internal" {
+				return true
+			}
+			pkgPath = path.Dir(pkgPath)
+		}
+		return false
+	}
+	r := report{
+		base:    base,
+		release: release,
+	}
+	for _, pair := range zipPackages(base.modPath, base.pkgs, release.modPath, release.pkgs) {
+		basePkg, releasePkg := pair.base, pair.release
+		switch {
+		case releasePkg == nil:
+			// Package removed
+			if internal := isInternal(base.modPath, basePkg.PkgPath); !internal || len(basePkg.Errors) > 0 {
+				pr := packageReport{
+					path:       basePkg.PkgPath,
+					baseErrors: basePkg.Errors,
+				}
+				if !internal {
+					pr.Report = apidiff.Report{
+						Changes: []apidiff.Change{{
+							Message:    "package removed",
+							Compatible: false,
+						}},
+					}
+				}
+				r.addPackage(pr)
+			}
+
+		case basePkg == nil:
+			// Package added
+			if internal := isInternal(release.modPath, releasePkg.PkgPath); !internal && shouldCompare || len(releasePkg.Errors) > 0 {
+				pr := packageReport{
+					path:          releasePkg.PkgPath,
+					releaseErrors: releasePkg.Errors,
+				}
+				if !internal && shouldCompare {
+					// If we aren't comparing against a base version, don't say
+					// "package added". Only report packages with errors.
+					pr.Report = apidiff.Report{
+						Changes: []apidiff.Change{{
+							Message:    "package added",
+							Compatible: true,
+						}},
+					}
+				}
+				r.addPackage(pr)
+			}
+
+		default:
+			// Matched packages
+			// Both packages are internal or neither; we only consider path components
+			// after the module path.
+			internal := isInternal(release.modPath, releasePkg.PkgPath)
+			if !internal && basePkg.Name != "main" && releasePkg.Name != "main" {
+				pr := packageReport{
+					path:          basePkg.PkgPath,
+					baseErrors:    basePkg.Errors,
+					releaseErrors: releasePkg.Errors,
+					Report:        apidiff.Changes(basePkg.Types, releasePkg.Types),
+				}
+				r.addPackage(pr)
+			}
+		}
+	}
+
+	if r.canVerifyReleaseVersion() {
+		if release.version == "" {
+			r.suggestReleaseVersion()
+		} else {
+			r.validateReleaseVersion()
+		}
+	}
+
+	return r, nil
+}
+
+// zipPackages combines two lists of packages, sorted by package path,
+// and returns a sorted list of pairs of packages with matching paths.
+// If a package is in one list but not the other (because it was added or
+// removed between releases), a pair will be returned with a nil
+// base or release field.
+func zipPackages(baseModPath string, basePkgs []*packages.Package, releaseModPath string, releasePkgs []*packages.Package) []packagePair {
+	baseIndex, releaseIndex := 0, 0
+	var pairs []packagePair
+	for baseIndex < len(basePkgs) || releaseIndex < len(releasePkgs) {
+		var basePkg, releasePkg *packages.Package
+		var baseSuffix, releaseSuffix string
+		if baseIndex < len(basePkgs) {
+			basePkg = basePkgs[baseIndex]
+			baseSuffix = trimPathPrefix(basePkg.PkgPath, baseModPath)
+		}
+		if releaseIndex < len(releasePkgs) {
+			releasePkg = releasePkgs[releaseIndex]
+			releaseSuffix = trimPathPrefix(releasePkg.PkgPath, releaseModPath)
+		}
+
+		var pair packagePair
+		if basePkg != nil && (releasePkg == nil || baseSuffix < releaseSuffix) {
+			// Package removed
+			pair = packagePair{basePkg, nil}
+			baseIndex++
+		} else if releasePkg != nil && (basePkg == nil || releaseSuffix < baseSuffix) {
+			// Package added
+			pair = packagePair{nil, releasePkg}
+			releaseIndex++
+		} else {
+			// Matched packages.
+			pair = packagePair{basePkg, releasePkg}
+			baseIndex++
+			releaseIndex++
+		}
+		pairs = append(pairs, pair)
+	}
+	return pairs
+}
+
+// trimPathPrefix returns p without the leading prefix. Unlike
+// strings.TrimPrefix, the prefix will only match on slash-separted component
+// boundaries, so trimPathPrefix("aa/b", "aa") returns "b", but
+// trimPathPrefix("aa/b", "a") returns "aa/b".
+func trimPathPrefix(p, prefix string) string {
+	if prefix == "" {
+		return p
+	}
+	if prefix == p {
+		return ""
+	}
+	return strings.TrimPrefix(p, prefix+"/")
 }
