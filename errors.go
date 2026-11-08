@@ -58,3 +58,4 @@ func (e *downloadError) Error() string {
 	}
 	return fmt.Sprintf("error downloading module %s@%s:%s%s", e.m.Path, e.m.Version, sep, msg)
 }
+
